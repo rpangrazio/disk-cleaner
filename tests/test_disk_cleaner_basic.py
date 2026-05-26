@@ -2,6 +2,7 @@ import os
 import tempfile
 import shutil
 import json
+import sqlite3
 import subprocess
 
 
@@ -41,3 +42,30 @@ def test_apply_copy_plan(tmp_path):
     report = tmp_path / "r2.json"
     code, out = run_cmd(["--source", str(src), "--dest", str(dest), "--report", str(report)])
     assert code == 0, out
+
+
+def test_sqlite_backend_persists_file_attributes(tmp_path):
+    src = tmp_path / "src3"
+    src.mkdir()
+    (src / "note.txt").write_text("hello", encoding="utf-8")
+    (src / "photo.jpg").write_text("data", encoding="utf-8")
+
+    db = tmp_path / "scan.db"
+    report = tmp_path / "r3.json"
+
+    code, out = run_cmd(["--source", str(src), "--report", str(report), "--sqlite-db", str(db)])
+    assert code == 0, out
+    assert db.exists()
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT source_root, path, relative_path, name, extension, size FROM file_attributes ORDER BY name"
+        ).fetchall()
+
+    assert len(rows) == 2
+    source_root = os.path.abspath(str(src))
+    assert all(r[0] == source_root for r in rows)
+    assert rows[0][3] == "note.txt"
+    assert rows[0][4] == "txt"
+    assert rows[1][3] == "photo.jpg"
+    assert rows[1][4] == "jpg"

@@ -24,6 +24,7 @@ import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import time
 from collections import defaultdict
@@ -125,8 +126,18 @@ class OpenAIStyleClient:
         return out
 
 
-def scan_files(root: str, follow_symlinks: bool = False) -> List[Dict]:
+def scan_files(
+    root: str,
+    follow_symlinks: bool = False,
+    show_progress: bool = False,
+    progress_every: int = 500,
+) -> List[Dict]:
     files = []
+    scanned = 0
+
+    if show_progress:
+        print("Progress: scanning files...", flush=True)
+
     for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_symlinks):
         for fn in filenames:
             full = os.path.join(dirpath, fn)
@@ -142,7 +153,109 @@ def scan_files(root: str, follow_symlinks: bool = False) -> List[Dict]:
                     "mtime": st.st_mtime,
                 }
             )
+            scanned += 1
+            if show_progress and scanned % progress_every == 0:
+                print(f"Progress: scanned {scanned} files...", flush=True)
+
+    if show_progress:
+        print(f"Progress: scan complete ({scanned} files)", flush=True)
+
     return files
+
+
+def persist_file_attributes_sqlite(db_path: str, source_root: str, files: List[Dict], clear_existing: bool = False) -> None:
+    """Persist scanned file attributes into a SQLite database for later analysis.
+
+    The table is append-only by default; pass clear_existing=True to replace prior rows
+    for the same source_root.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    source_root_abs = os.path.abspath(source_root)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_attributes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_root TEXT NOT NULL,
+                path TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                extension TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime REAL NOT NULL,
+                mtime_iso TEXT NOT NULL,
+                scanned_at TEXT NOT NULL,
+                UNIQUE(source_root, path)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_file_attributes_source_root
+            ON file_attributes (source_root)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_file_attributes_extension
+            ON file_attributes (extension)
+            """
+        )
+
+        if clear_existing:
+            conn.execute("DELETE FROM file_attributes WHERE source_root = ?", (source_root_abs,))
+
+        scanned_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        rows = []
+        for f in files:
+            abs_path = os.path.abspath(f["path"])
+            ext = os.path.splitext(f["name"])[1].lower().lstrip(".") or "no_ext"
+            try:
+                rel_path = os.path.relpath(abs_path, source_root_abs)
+            except Exception:
+                rel_path = f["name"]
+            mtime = float(f["mtime"])
+            mtime_iso = datetime.utcfromtimestamp(mtime).isoformat(timespec="seconds") + "Z"
+            rows.append(
+                (
+                    source_root_abs,
+                    abs_path,
+                    rel_path,
+                    f["name"],
+                    ext,
+                    int(f["size"]),
+                    mtime,
+                    mtime_iso,
+                    scanned_at,
+                )
+            )
+
+        conn.executemany(
+            """
+            INSERT INTO file_attributes (
+                source_root,
+                path,
+                relative_path,
+                name,
+                extension,
+                size,
+                mtime,
+                mtime_iso,
+                scanned_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_root, path) DO UPDATE SET
+                relative_path = excluded.relative_path,
+                name = excluded.name,
+                extension = excluded.extension,
+                size = excluded.size,
+                mtime = excluded.mtime,
+                mtime_iso = excluded.mtime_iso,
+                scanned_at = excluded.scanned_at
+            """,
+            rows,
+        )
+        conn.commit()
 
 
 def find_duplicates_by_hash(files: List[Dict], md5_for_all: bool = False, size_threshold: int = 1024 * 8) -> Dict[str, List[str]]:
@@ -289,9 +402,20 @@ def build_plan_for_proposals(proposals: Dict[str, List], dest_root: str, mode: s
     return plan
 
 
-def apply_plan(plan: List[Dict], dry_run: bool = True) -> List[Dict]:
+def apply_plan(
+    plan: List[Dict],
+    dry_run: bool = True,
+    show_progress: bool = False,
+    progress_every: int = 200,
+) -> List[Dict]:
     results = []
-    for step in plan:
+    total_steps = len(plan)
+
+    if show_progress:
+        mode = "simulating" if dry_run else "applying"
+        print(f"Progress: {mode} plan ({total_steps} actions)...", flush=True)
+
+    for idx, step in enumerate(plan, start=1):
         src = step["src"]
         dst = step["dst"]
         action = step.get("action", "copy")
@@ -313,6 +437,11 @@ def apply_plan(plan: List[Dict], dry_run: bool = True) -> List[Dict]:
         except Exception as e:
             errmsg = str(e)
         results.append({"src": src, "dst": dst, "action": action, "ok": ok, "error": errmsg})
+
+        if show_progress and total_steps > 0 and (idx % progress_every == 0 or idx == total_steps):
+            pct = (idx / total_steps) * 100.0
+            print(f"Progress: {idx}/{total_steps} actions ({pct:.1f}%)", flush=True)
+
     return results
 
 
@@ -333,6 +462,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--md5-all", action="store_true", help="Compute MD5 for all files (may be slow) and detect exact duplicates")
     p.add_argument("--yes", action="store_true", help="Agree to perform actions when --apply is set")
     p.add_argument("--dry-run", action="store_true", help="Do not perform any file operations; show the full plan and size estimates")
+    p.add_argument("--sqlite-db", help="Path to SQLite DB where scanned file attributes are persisted")
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress output",
+    )
+    p.add_argument(
+        "--sqlite-clear-existing",
+        action="store_true",
+        help="Delete existing rows for this source root before inserting fresh scan results",
+    )
     args = p.parse_args(argv)
 
     src = args.source
@@ -340,10 +480,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"source directory not found: {src}")
         return 2
 
-    files = scan_files(src)
+    show_progress = not args.no_progress
+
+    files = scan_files(src, show_progress=show_progress)
+
+    if args.sqlite_db:
+        if show_progress:
+            print("Progress: persisting file attributes to SQLite...", flush=True)
+        try:
+            persist_file_attributes_sqlite(
+                db_path=args.sqlite_db,
+                source_root=src,
+                files=files,
+                clear_existing=args.sqlite_clear_existing,
+            )
+        except Exception as e:
+            print(f"failed to persist SQLite file attributes: {e}")
+            return 4
 
     total_size = sum(f["size"] for f in files)
 
+
+    if show_progress:
+        print("Progress: analyzing duplicates and similarity...", flush=True)
 
     dup_hash = find_duplicates_by_hash(files, md5_for_all=args.md5_all, size_threshold=args.md5_threshold)
     dup_name = find_similar_by_name(files)
@@ -351,6 +510,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     clusters = None
     if args.api_base and args.api_token:
+        if show_progress:
+            print("Progress: clustering by embeddings...", flush=True)
         client = OpenAIStyleClient(args.api_base, args.api_token, args.model, batch_size=args.batch_size)
         try:
             clusters = cluster_by_embeddings(client, files, max_file_bytes=1024 * 512, similarity_threshold=args.cluster_similarity)
@@ -482,6 +643,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     report["plan_summary"] = plan_summary
 
     if args.report:
+        if show_progress:
+            print(f"Progress: writing report to {args.report}...", flush=True)
         with open(args.report, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 
@@ -521,7 +684,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
         else:
             print("Applying plan...")
-        results = apply_plan(plan, dry_run=not perform_ops)
+        results = apply_plan(plan, dry_run=not perform_ops, show_progress=show_progress)
         success = sum(1 for r in results if r.get("ok"))
         # do not print per-file or step counts; keep silent here
 
